@@ -198,6 +198,32 @@ class Environment:
             wall_thickness
         ))
     
+    def clear_obstacles(self) -> None:
+        """Remove all obstacles from the environment"""
+        self.obstacles.clear()
+    
+    def regenerate_obstacles(self, env_type: str = "random", **kwargs) -> None:
+        """Clear current obstacles and generate new ones"""
+        self.clear_obstacles()
+        
+        if env_type == "random":
+            new_env = EnvironmentGenerator.create_random_environment(
+                self.width, self.height, **kwargs)
+        elif env_type == "maze":
+            new_env = EnvironmentGenerator.create_maze_environment(
+                self.width, self.height)
+        elif env_type == "open_field":
+            new_env = EnvironmentGenerator.create_open_field_environment(
+                self.width, self.height)
+        elif env_type == "obstacle_course":
+            new_env = EnvironmentGenerator.create_obstacle_course(
+                self.width, self.height)
+        else:
+            return  # Unknown type, keep empty
+        
+        # Copy obstacles from new environment
+        self.obstacles = new_env.obstacles.copy()
+    
     def add_obstacle(self, obstacle: Obstacle) -> None:
         """Add an obstacle to the environment"""
         self.obstacles.append(obstacle)
@@ -329,8 +355,142 @@ class EnvironmentGenerator:
         return env
     
     @staticmethod
+    def create_random_environment(width: float = 800, height: float = 600, 
+                                 num_obstacles: int = None, seed: int = None) -> Environment:
+        """Create a randomly generated environment with various obstacles"""
+        if seed is not None:
+            random.seed(seed)
+        
+        env = Environment(width, height, has_boundaries=True)
+        
+        # Default number of obstacles based on environment size
+        if num_obstacles is None:
+            area = width * height
+            num_obstacles = max(5, min(15, int(area / 30000)))  # Scale with area
+        
+        # Generate circular obstacles
+        num_circular = random.randint(num_obstacles // 2, num_obstacles)
+        for _ in range(num_circular):
+            # Random position with margins from edges
+            margin = 80
+            pos = Vector2D(
+                random.uniform(margin, width - margin),
+                random.uniform(margin, height - margin)
+            )
+            
+            # Random size (avoid too large obstacles)
+            radius = random.uniform(15, min(60, width/15, height/15))
+            
+            # Check if position is valid (not overlapping other obstacles too much)
+            valid_position = True
+            for existing in env.obstacles:
+                if isinstance(existing, CircularObstacle):
+                    dist = (pos - existing.position).magnitude()
+                    if dist < (radius + existing.radius + 20):  # 20px minimum separation
+                        valid_position = False
+                        break
+            
+            if valid_position:
+                env.add_obstacle(CircularObstacle(pos, radius))
+        
+        # Generate some walls
+        num_walls = random.randint(2, 5)
+        for _ in range(num_walls):
+            # Random wall orientation
+            if random.choice([True, False]):  # Horizontal wall
+                start_x = random.uniform(width * 0.1, width * 0.4)
+                end_x = start_x + random.uniform(width * 0.2, width * 0.4)
+                y = random.uniform(height * 0.2, height * 0.8)
+                start = Vector2D(start_x, y)
+                end = Vector2D(end_x, y)
+            else:  # Vertical wall
+                x = random.uniform(width * 0.2, width * 0.8)
+                start_y = random.uniform(height * 0.1, height * 0.4)
+                end_y = start_y + random.uniform(height * 0.2, height * 0.4)
+                start = Vector2D(x, start_y)
+                end = Vector2D(x, end_y)
+            
+            thickness = random.uniform(6, 12)
+            env.add_obstacle(Wall(start, end, thickness))
+        
+        return env
+    
+    @staticmethod
+    def create_maze_environment(width: float = 800, height: float = 600) -> Environment:
+        """Create a maze-like environment for challenging navigation"""
+        env = Environment(width, height, has_boundaries=True)
+        
+        # Create maze-like structure with corridors
+        corridor_width = 80
+        wall_thickness = 10
+        
+        # Vertical corridors
+        for i in range(2, 5):
+            x = width * i / 6
+            # Top wall
+            env.add_obstacle(Wall(
+                Vector2D(x - corridor_width/2, 0),
+                Vector2D(x - corridor_width/2, height * 0.4),
+                wall_thickness
+            ))
+            # Bottom wall
+            env.add_obstacle(Wall(
+                Vector2D(x + corridor_width/2, height * 0.6),
+                Vector2D(x + corridor_width/2, height),
+                wall_thickness
+            ))
+        
+        # Horizontal corridors
+        for i in range(2, 4):
+            y = height * i / 5
+            # Left wall
+            env.add_obstacle(Wall(
+                Vector2D(0, y - corridor_width/2),
+                Vector2D(width * 0.4, y - corridor_width/2),
+                wall_thickness
+            ))
+            # Right wall
+            env.add_obstacle(Wall(
+                Vector2D(width * 0.6, y + corridor_width/2),
+                Vector2D(width, y + corridor_width/2),
+                wall_thickness
+            ))
+        
+        # Add some circular obstacles in open areas
+        obstacles_data = [
+            (Vector2D(width * 0.2, height * 0.2), 25),
+            (Vector2D(width * 0.8, height * 0.8), 25),
+            (Vector2D(width * 0.7, height * 0.3), 20),
+            (Vector2D(width * 0.3, height * 0.7), 20),
+        ]
+        
+        for pos, radius in obstacles_data:
+            env.add_obstacle(CircularObstacle(pos, radius))
+        
+        return env
+    
+    @staticmethod
+    def create_open_field_environment(width: float = 800, height: float = 600) -> Environment:
+        """Create an open field with scattered obstacles for speed testing"""
+        env = Environment(width, height, has_boundaries=True)
+        
+        # Few scattered obstacles for high-speed navigation testing
+        obstacles_data = [
+            (Vector2D(width * 0.3, height * 0.3), 40),
+            (Vector2D(width * 0.7, height * 0.7), 40),
+            (Vector2D(width * 0.6, height * 0.2), 30),
+            (Vector2D(width * 0.2, height * 0.8), 30),
+            (Vector2D(width * 0.5, height * 0.5), 25),
+        ]
+        
+        for pos, radius in obstacles_data:
+            env.add_obstacle(CircularObstacle(pos, radius))
+        
+        return env
+    
+    @staticmethod
     def create_obstacle_course(width: float = 800, height: float = 600) -> Environment:
-        """Create an obstacle course for robot navigation testing"""
+        """Create a structured obstacle course for robot navigation testing"""
         env = Environment(width, height, has_boundaries=True)
         
         # Add various types of obstacles

@@ -38,6 +38,11 @@ def main():
     print("  S: Toggle sensor display")
     print("  P: Toggle path history")
     print("  R: Reset path history")
+    print("  G: Generate new random map")
+    print("  1: Generate obstacle course map")
+    print("  2: Generate maze map")
+    print("  3: Generate open field map")
+    print("  4: Generate random map with seed")
     print("  ESC: Exit simulation")
     print()
     print("Features:")
@@ -48,25 +53,17 @@ def main():
     
     # Create simulation components
     physics_world = PhysicsWorld()
-    environment = EnvironmentGenerator.create_empty_environment(800, 600)
+    environment = EnvironmentGenerator.create_random_environment(800, 600)  # Start with random environment
     
     # Create robot at center of environment
     start_position = Vector2D(400, 300)
     robot = create_robot("simple", position=start_position)
     physics_world.add_body(robot.body)
     
-    # Add some obstacles for testing
-    from src.environment import CircularObstacle
-    obstacles = [
-        CircularObstacle(Vector2D(200, 150), 30),
-        CircularObstacle(Vector2D(600, 450), 40),
-        CircularObstacle(Vector2D(500, 200), 25),
-        CircularObstacle(Vector2D(300, 500), 35)
-    ]
-    
-    for obstacle in obstacles:
-        environment.add_obstacle(obstacle)
-        physics_world.add_body(obstacle.body)
+    # Add obstacles from environment to physics world
+    for obstacle in environment.obstacles:
+        if hasattr(obstacle, 'body') and obstacle.body:
+            physics_world.add_body(obstacle.body)
     
     # Create sensor array
     sensor_array = create_default_sensor_array()
@@ -82,6 +79,39 @@ def main():
     
     # Create renderer
     renderer = SimulationRenderer(1200, 800)
+    
+    def regenerate_environment(env_type: str, **kwargs):
+        """Regenerate the environment with a new layout"""
+        nonlocal environment, autonomous_controller, control_mode
+        
+        # Clear physics world of old obstacles
+        for obstacle in environment.obstacles:
+            if hasattr(obstacle, 'body') and obstacle.body:
+                physics_world.remove_body(obstacle.body)
+        
+        # Generate new environment
+        environment.regenerate_obstacles(env_type, **kwargs)
+        
+        # Add new obstacles to physics world
+        for obstacle in environment.obstacles:
+            if hasattr(obstacle, 'body') and obstacle.body:
+                physics_world.add_body(obstacle.body)
+        
+        # Reset robot to center and stop any current navigation
+        robot.body.position = Vector2D(400, 300)
+        robot.body.velocity = Vector2D(0, 0)
+        robot.body.angular_velocity = 0.0
+        robot.reset_path()
+        
+        # Reinitialize autonomous controller with new environment
+        autonomous_controller = PrecisionMovementController(robot, sensor_array, environment)
+        
+        # Switch to manual mode
+        control_mode = "manual"
+        autonomous_controller.disable()
+        manual_controller.enable()
+        
+        print(f"Generated new {env_type} environment!")
     
     # Simulation loop
     running = True
@@ -117,6 +147,24 @@ def main():
                     renderer.toggle_path_display()
                 elif event.key == pygame.K_r:
                     robot.reset_path()
+                elif event.key == pygame.K_g:
+                    # Generate new random map
+                    regenerate_environment("random")
+                elif event.key == pygame.K_1:
+                    # Generate obstacle course map
+                    regenerate_environment("obstacle_course")
+                elif event.key == pygame.K_2:
+                    # Generate maze map
+                    regenerate_environment("maze")
+                elif event.key == pygame.K_3:
+                    # Generate open field map
+                    regenerate_environment("open_field")
+                elif event.key == pygame.K_4:
+                    # Generate random map with specific seed for reproducibility
+                    import time
+                    seed = int(time.time()) % 10000
+                    regenerate_environment("random", seed=seed)
+                    print(f"Generated random map with seed: {seed}")
             
             elif event.type == pygame.KEYUP:
                 if event.key in keys_pressed:

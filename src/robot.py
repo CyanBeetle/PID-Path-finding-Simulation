@@ -24,7 +24,7 @@ class DifferentialDriveRobot:
     """
     
     def __init__(self, position: Vector2D, wheel_base: float = 20.0, 
-                 wheel_radius: float = 5.0, max_wheel_speed: float = 100.0):
+                 wheel_radius: float = 5.0, max_wheel_speed: float = 300.0):
         """
         Initialize the differential drive robot
         
@@ -107,33 +107,78 @@ class DifferentialDriveRobot:
     def update(self, dt: float, physics_world: PhysicsWorld):
         """
         Update robot state based on wheel commands
-        This is called every simulation step
+        This is called every simulation step with realistic physics
         """
         # Get velocities from wheel speeds
         linear_vel, angular_vel = self.get_velocity()
         
-        # Apply forces and torques to physics body
-        if linear_vel != 0:
-            # Apply force in forward direction
-            forward_direction = self.body.get_forward_vector()
-            force = forward_direction * (linear_vel * self.body.mass)
+        # REALISTIC PHYSICS-BASED CONTROL with momentum
+        # Apply forces/torques but with better tuning for differential drive
+        
+        current_linear_vel = self.body.velocity.magnitude()
+        current_angular_vel = abs(self.body.angular_velocity)
+        
+        # Get current forward direction
+        forward_direction = self.body.get_forward_vector()
+        current_forward_vel = self.body.velocity.dot(forward_direction)
+        
+        # Linear motion control with realistic response
+        if abs(linear_vel) > 0.01:
+            # Calculate desired velocity in world coordinates
+            desired_velocity_world = forward_direction * linear_vel
+            
+            # PID-like force application for smooth acceleration/deceleration
+            velocity_error = desired_velocity_world - self.body.velocity
+            
+            # Force proportional to velocity error (acts like a velocity controller)
+            force_gain = 120.0  # Increased for more responsive control
+            force = velocity_error * (force_gain * self.body.mass)
+            
+            # Limit maximum force to prevent unrealistic acceleration
+            max_force = self.body.mass * 600.0  # Increased acceleration limit for speed
+            if force.magnitude() > max_force:
+                force = force.normalize() * max_force
+            
             self.body.apply_force(force)
         
-        if angular_vel != 0:
-            # Apply torque for rotation
-            torque = angular_vel * self.body.moment_of_inertia
+        # Angular motion control with realistic response
+        if abs(angular_vel) > 0.01:
+            # Angular velocity PID control
+            angular_error = angular_vel - self.body.angular_velocity
+            
+            # Torque proportional to angular velocity error
+            torque_gain = 40.0  # Increased for faster turning
+            torque = angular_error * (torque_gain * self.body.moment_of_inertia)
+            
+            # Limit maximum torque
+            max_torque = self.body.moment_of_inertia * 100.0  # Increased for faster rotation
+            torque = max(-max_torque, min(max_torque, torque))
+            
             self.body.apply_torque(torque)
         
-        # Add some friction to make movement more realistic
-        friction_coefficient = 0.2
-        angular_friction_coefficient = 1.5  # Much higher for angular motion
+        # Realistic friction modeling for differential drive robots
+        # Reduced friction for faster movement while maintaining control
         
-        friction_force = self.body.velocity * (-friction_coefficient * self.body.mass)
+        # Linear friction - reduced for higher speeds
+        linear_friction_coeff = 0.5 if current_linear_vel < 10.0 else 0.25
+        friction_force = self.body.velocity * (-linear_friction_coeff * self.body.mass)
         self.body.apply_force(friction_force)
         
-        # Higher angular friction to reduce spinning
-        angular_friction = -self.body.angular_velocity * angular_friction_coefficient * self.body.moment_of_inertia
+        # Angular friction - reduced for faster turning
+        angular_friction_coeff = 1.5 if current_angular_vel < 2.0 else 0.8
+        angular_friction = -self.body.angular_velocity * (angular_friction_coeff * self.body.moment_of_inertia)
         self.body.apply_torque(angular_friction)
+        
+        # When no commands given, apply stronger damping to settle quickly
+        if abs(linear_vel) < 0.01 and abs(angular_vel) < 0.01:
+            # Apply settling forces to come to rest realistically
+            if current_linear_vel > 0.1:
+                settling_force = self.body.velocity * (-2.0 * self.body.mass)
+                self.body.apply_force(settling_force)
+            
+            if current_angular_vel > 0.05:
+                settling_torque = -self.body.angular_velocity * (4.0 * self.body.moment_of_inertia)
+                self.body.apply_torque(settling_torque)
         
         # Update path history
         current_pos = self.body.position.copy()
@@ -194,27 +239,35 @@ class DifferentialDriveRobot:
         - Much more effective than just setting wheel speeds to zero
         """
         # Strong braking force opposing current motion
-        brake_coefficient = 5.0  # Much stronger than normal friction (0.1)
         
-        # Linear braking - apply force opposing current velocity
-        if self.body.velocity.magnitude() > 0.1:  # Only brake if moving
-            brake_force = self.body.velocity * (-brake_coefficient * self.body.mass)
+        # REALISTIC EMERGENCY BRAKING - like real robot brakes
+        # Apply strong opposing forces rather than instant stop
+        
+        # Strong linear braking force
+        if self.body.velocity.magnitude() > 0.1:
+            # Apply maximum braking force in opposite direction
+            brake_force_magnitude = 10.0 * self.body.mass  # Strong but realistic
+            brake_direction = self.body.velocity.normalize() * -1
+            brake_force = brake_direction * brake_force_magnitude
             self.body.apply_force(brake_force)
         
-        # Angular braking - apply torque opposing current rotation
-        if abs(self.body.angular_velocity) > 0.01:  # Only brake if rotating
-            angular_brake = -self.body.angular_velocity * brake_coefficient * self.body.moment_of_inertia
-            self.body.apply_torque(angular_brake)
+        # Strong angular braking torque
+        if abs(self.body.angular_velocity) > 0.01:
+            # Apply maximum braking torque
+            brake_torque_magnitude = 10.0 * self.body.moment_of_inertia
+            brake_torque = -math.copysign(brake_torque_magnitude, self.body.angular_velocity)
+            self.body.apply_torque(brake_torque)
         
-        # Also set wheel speeds to zero to prevent new motion
+        # Set wheel speeds to zero to prevent new motion commands
         self.set_wheel_speeds(0, 0)
     
-    def is_stopped(self, velocity_threshold: float = 0.5) -> bool:
+    def is_stopped(self, velocity_threshold: float = 1.0) -> bool:
         """
         Check if robot has come to a complete stop
         
         Args:
             velocity_threshold: Speed below which robot is considered stopped
+            (adjusted higher for momentum-based physics)
         
         Returns:
             True if robot is effectively stopped
@@ -222,7 +275,7 @@ class DifferentialDriveRobot:
         linear_speed = self.body.velocity.magnitude()
         angular_speed = abs(self.body.angular_velocity)
         
-        return linear_speed < velocity_threshold and angular_speed < 0.05
+        return linear_speed < velocity_threshold and angular_speed < 0.1
     
     def is_near_target(self, target: Vector2D, threshold: float = 10.0) -> bool:
         """Check if robot is near a target position"""
@@ -315,8 +368,8 @@ class ManualController(RobotController):
         super().__init__(robot)
         self.linear_command = 0.0
         self.angular_command = 0.0
-        self.max_linear_speed = 80.0
-        self.max_angular_speed = 2.0
+        self.max_linear_speed = 200.0  # Increased for faster manual control
+        self.max_angular_speed = 4.0   # Increased for faster turning
     
     def set_commands(self, linear: float, angular: float):
         """Set manual control commands (-1 to 1 range)"""
