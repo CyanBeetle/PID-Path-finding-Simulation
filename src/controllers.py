@@ -18,6 +18,7 @@ from .physics import Vector2D
 from .robot import DifferentialDriveRobot, RobotController
 from .sensors import SensorArray
 from .pathfinding import AStarPathfinder, NavigationGrid
+from .config import CONTROLLER_CONFIG
 
 
 class PrecisionMovementController(RobotController):
@@ -38,18 +39,20 @@ class PrecisionMovementController(RobotController):
     4. Strong obstacle avoidance that adapts to proximity
     """
     
-    def __init__(self, robot: DifferentialDriveRobot, sensor_array: SensorArray, environment=None):
+    def __init__(self, robot: DifferentialDriveRobot, sensor_array: SensorArray, environment=None, config: Dict[str, Any] = None):
         super().__init__(robot)
         self.sensor_array = sensor_array
         self.environment = environment
         
+        # Load configuration
+        self.config = config if config is not None else CONTROLLER_CONFIG
+        self._load_config()
+
         # Pathfinding setup
-        self.grid_size = 3.0  # Smaller grid for smoother, more direct paths
         self.navigation_grid = None
         self.pathfinder = None
         self.current_path = []
         self.current_waypoint_index = 0
-        self.waypoint_tolerance = 8.0       # Reduced for more aggressive advancement
         
         # Initialize pathfinding if environment is provided
         if environment:
@@ -57,48 +60,56 @@ class PrecisionMovementController(RobotController):
         
         # Target management
         self.target_position = None
-        self.target_tolerance = 10.0  # Slightly larger for final target
-        self.angle_tolerance = 0.05  # Very precise angle tolerance
-        
-        # Distance-based velocity scaling
-        self.max_distance = 300.0        # Distance at which we use max velocity
-        self.precision_distance = 50.0       # Increased for higher speeds closer to target  
-        self.max_velocity = 300.0            # Increased for much faster autonomous movement
-        self.min_velocity = 20.0         # Increased minimum velocity for faster approach
-        
-        # Emergency braking zone
-        self.brake_distance = 15.0           # Slightly larger for higher speeds
-        self.brake_force = 300.0         # Increased brake force for higher speeds
-        
-        # Velocity damping - adjusted for momentum
-        self.base_damping = 0.1          # Further reduced base damping for speed 
-        self.max_damping = 0.6           # Reduced maximum damping for speed
-        
-        # Angular control
-        self.max_angular_velocity = 4.0  # Increased for faster turning
-        self.angular_damping = 0.3       # Reduced angular damping for faster response
-        
-        # Wall avoidance (SPEED-ADAPTIVE for high-speed navigation)
-        self.base_wall_avoidance_distance = 25.0  # Base detection distance
-        self.max_wall_avoidance_distance = 60.0   # Extended distance at high speed
-        self.wall_avoidance_strength = 0.6        # Increased for stronger response
-        self.emergency_avoidance_distance = 20.0  # Critical distance for emergency maneuvers
-        self.max_emergency_distance = 40.0        # Extended emergency distance at high speed
-        
-        # Control gains - optimized for speed while maintaining precision
-        self.position_kp = 4.0    # Much higher gain for faster response
-        self.position_ki = 0.08   # Slightly increased integral for steady tracking
-        self.position_kd = 0.4    # Reduced derivative to avoid over-damping at speed
-        
-        self.angle_kp = 6.0       # Higher angular response for quick turns
-        self.angle_ki = 0.05      # Slightly increased angular integral  
-        self.angle_kd = 0.3       # Reduced to allow faster angular response
-        
+
         # Internal state
         self.position_integral = 0.0
         self.angle_integral = 0.0
         self.prev_position_error = 0.0
         self.prev_angle_error = 0.0
+
+    def _load_config(self):
+        """Load parameters from the configuration dictionary."""
+        # Pathfinding and Navigation
+        self.grid_size = self.config.get("grid_size", 20.0)
+        self.waypoint_tolerance = self.config["waypoint_tolerance"]
+        self.target_tolerance = self.config["target_tolerance"]
+        self.angle_tolerance = self.config["angle_tolerance"]
+        self.lookahead_distance = self.config["lookahead_distance"]
+
+        # Velocity Control
+        self.max_velocity = self.config["max_velocity"]
+        self.min_velocity = self.config["min_velocity"]
+        self.max_distance_for_full_speed = self.config["max_distance_for_full_speed"]
+        self.precision_distance = self.config["precision_distance"]
+
+        # PID Gains (Position)
+        self.position_kp = self.config["position_kp"]
+        self.position_ki = self.config["position_ki"]
+        self.position_kd = self.config["position_kd"]
+        self.position_integral_clamp = self.config["position_integral_clamp"]
+
+        # PID Gains (Angular)
+        self.angle_kp = self.config["angle_kp"]
+        self.angle_ki = self.config["angle_ki"]
+        self.angle_kd = self.config["angle_kd"]
+        self.angle_integral_clamp = self.config["angle_integral_clamp"]
+
+        # Damping and Braking
+        self.base_damping = self.config["velocity_damping_base"]
+        self.max_damping = self.config["velocity_damping_max"]
+        self.angular_damping = self.config["angular_damping"]
+        self.brake_distance = self.config["brake_distance"]
+        self.brake_force = self.config["brake_force"]
+        self.max_angular_velocity = self.config.get("max_angular_velocity", 4.0)
+
+        # Obstacle Avoidance
+        self.wall_avoidance_strength = self.config["obstacle_avoidance_strength"]
+        self.base_wall_avoidance_distance = self.config["wall_detection_distance"]
+        self.emergency_avoidance_distance = self.config["emergency_detection_distance"]
+
+        # Speed-adaptive parameters (can be derived or set)
+        self.max_wall_avoidance_distance = self.config.get("max_wall_avoidance_distance", self.base_wall_avoidance_distance * 2)
+        self.max_emergency_distance = self.config.get("max_emergency_distance", self.emergency_avoidance_distance * 2)
     
     def _initialize_pathfinding(self):
         """Initialize the pathfinding grid based on environment"""
@@ -210,296 +221,205 @@ class PrecisionMovementController(RobotController):
         return target_waypoint, target_index
     
     def update(self, dt: float):
-        """Update precision movement controller with A* pathfinding"""
+        """Update the controller, orchestrating waypoint navigation, safety, and control commands."""
         if not self.enabled or self.target_position is None or not self.current_path:
             self.robot.stop()
             return
-        
+
         current_pos = self.robot.get_position()
+
+        if not self._update_waypoint(current_pos):
+            self.robot.emergency_brake()
+            self.target_position = None
+            return
+
+        target_waypoint, waypoint_idx = self.get_lookahead_waypoint(current_pos, self.lookahead_distance)
+
+        if self._perform_safety_checks(current_pos, waypoint_idx):
+            return
+
+        linear_velocity, angular_velocity, state = self._calculate_pid_commands(dt, current_pos, target_waypoint)
         
-        # PROPER WAYPOINT ADVANCEMENT: Skip waypoints that are behind us
-        while (self.current_waypoint_index < len(self.current_path) - 1):
-            current_waypoint = self.current_path[self.current_waypoint_index]
-            waypoint_distance = (current_waypoint - current_pos).magnitude()
-            
-            if waypoint_distance < self.waypoint_tolerance:
-                # Skip to next waypoint
+        linear_velocity, angular_velocity = self._apply_obstacle_avoidance(linear_velocity, angular_velocity)
+
+        self._finalize_and_send_commands(linear_velocity, angular_velocity, state['distance'], state['angle_error'])
+
+    def _update_waypoint(self, current_pos: Vector2D) -> bool:
+        """
+        Advances the current waypoint if the robot is close enough.
+        Returns False if the end of the path is reached.
+        """
+        while self.current_waypoint_index < len(self.current_path) - 1:
+            waypoint = self.current_path[self.current_waypoint_index]
+            if (waypoint - current_pos).magnitude() < self.waypoint_tolerance:
                 self.current_waypoint_index += 1
             else:
                 break
         
-        # Check if we've reached the end of the path
-        if self.current_waypoint_index >= len(self.current_path):
-            # Reached end of path
-            self.robot.emergency_brake()
-            self.target_position = None
-            return
-        
-        # Use improved lookahead waypoint selection that tracks which waypoint we're targeting
-        target_waypoint, target_waypoint_index = self.get_lookahead_waypoint(current_pos, lookahead_distance=30.0)  # Increased for high speed
-        
-        # CRITICAL FIX: Update current_waypoint_index based on what we're actually targeting
-        # If we're targeting a waypoint ahead, advance our index appropriately
-        if target_waypoint_index > self.current_waypoint_index:
-            # Check if we've passed waypoints in between
-            for i in range(self.current_waypoint_index, target_waypoint_index):
-                intermediate_waypoint = self.current_path[i]
-                dist_to_intermediate = (intermediate_waypoint - current_pos).magnitude()
-                if dist_to_intermediate < self.waypoint_tolerance:
-                    self.current_waypoint_index = i + 1
-        
-        to_waypoint = target_waypoint - current_pos
-        waypoint_distance = to_waypoint.magnitude()
-        
-        # Check if very close to final target for precision stop
-        final_target_distance = (self.target_position - current_pos).magnitude()
-        if final_target_distance < self.target_tolerance:
-            self.robot.emergency_brake()
-            self.target_position = None
-            return
-        
-        # ADDITIONAL SAFETY: High-speed obstacle proximity check
-        current_speed = self.robot.body.velocity.magnitude()
-        if current_speed > 100.0:  # Only at high speeds
-            # Check if there are obstacles very close in movement direction
-            velocity_direction = self.robot.body.velocity.normalize() if current_speed > 0 else Vector2D(1, 0)
-            look_ahead_distance = current_speed * 0.3  # Look ahead based on speed
-            look_ahead_pos = current_pos + velocity_direction * look_ahead_distance
-            
-            # If obstacle detected in movement direction, apply emergency braking
-            if self.environment.is_collision(look_ahead_pos, 15.0):
-                self.robot.emergency_brake()
-                return
-        
-        # EMERGENCY BRAKE ZONE: Apply active braking when very close to FINAL target only
-        robot_velocity = self.robot.body.velocity
-        current_speed = robot_velocity.magnitude()
-        
-        # Use waypoint distance for control calculations
-        distance = waypoint_distance
-        to_target = to_waypoint
-        
-        # ONLY brake at final target, not at waypoints
-        is_final_approach = (target_waypoint_index >= len(self.current_path) - 1)
+        return self.current_waypoint_index < len(self.current_path)
 
-        if is_final_approach and final_target_distance < self.brake_distance:
-            # Apply emergency braking only for final target
-            if current_speed > 5.0:
-                self.robot.emergency_brake()
-                return
-        
-        # Calculate desired direction
-        target_direction = to_target.normalize() if distance > 0 else Vector2D(0, 0)
-        
-        # Get current robot state
-        velocity_toward_target = robot_velocity.dot(target_direction) if distance > 0 else 0.0
-        
-        # Calculate angle to target
-        current_angle = self.robot.get_orientation()
-        target_angle = math.atan2(to_target.y, to_target.x)
-        angle_error = target_angle - current_angle
-        
-        # Normalize angle error to [-π, π]
-        while angle_error > math.pi:
-            angle_error -= 2 * math.pi
-        while angle_error < -math.pi:
-            angle_error += 2 * math.pi
-        
-        # === DISTANCE-ADAPTIVE VELOCITY CONTROL ===
-        
-        # Calculate velocity scale based on distance - MUCH LESS CONSERVATIVE
-        if distance > self.max_distance:
-            velocity_scale = 1.0  # Full speed when far
-        elif distance < self.precision_distance:
-            velocity_scale = 0.8 + 0.2 * (distance / self.precision_distance)  # 80-100% instead of 50-100%
-        else:
-            velocity_scale = 0.9 + 0.1 * (distance / self.max_distance)       # 90-100% instead of 70-100%
-        
-        # NEW: Angle-based speed scaling - only slow down for sharp turns
-        angle_magnitude = abs(angle_error)
-        if angle_magnitude > math.pi/3:  # Sharp turn (>60 degrees)
-            angle_speed_factor = 0.6  # Slow down significantly
-        elif angle_magnitude > math.pi/6:  # Medium turn (>30 degrees)
-            angle_speed_factor = 0.8  # Moderate slowdown
-        else:  # Small turn (<30 degrees)
-            angle_speed_factor = 1.0  # Full speed when well-aligned
-        
-        # Apply both distance and angle scaling (take minimum for safety)
-        velocity_scale = min(velocity_scale, angle_speed_factor)
-        
-        # Calculate adaptive damping - REDUCED for faster movement
-        if distance < self.precision_distance:
-            damping_factor = self.base_damping + (self.max_damping - self.base_damping) * \
-                           (1.0 - distance / self.precision_distance) * 0.5  # Reduce damping effect by 50%
-        else:
-            damping_factor = self.base_damping * 0.5  # Much less damping when far
-        
-        # === POSITION CONTROL WITH ADAPTIVE PARAMETERS ===
-        
-        # PID for position
-        self.position_integral += distance * dt
-        self.position_integral = max(-50, min(50, self.position_integral))  # Clamp integral
-        
-        position_derivative = (distance - self.prev_position_error) / dt if dt > 0 else 0.0
-        
-        # Base velocity command
-        desired_velocity = (self.position_kp * distance + 
-                          self.position_ki * self.position_integral + 
-                          self.position_kd * position_derivative)
-        
-        # Add feedforward term for better high-speed tracking
-        # This reduces lag by anticipating the required velocity
-        feedforward_velocity = self.max_velocity * 0.7 if distance > 50 else 0
-        desired_velocity += feedforward_velocity
-        
-        # Apply distance-based scaling
-        desired_velocity *= velocity_scale
-        
-        # Apply velocity damping (counter current momentum)
-        velocity_damping = damping_factor * velocity_toward_target
-        linear_velocity = desired_velocity - velocity_damping
-        
-        # Clamp to velocity limits - LESS RESTRICTIVE
-        max_vel = self.max_velocity * velocity_scale
-        # Remove aggressive min_velocity enforcement except when very close
-        if distance > 15:  # Only enforce min velocity when close
-            linear_velocity = max(0, min(max_vel, linear_velocity))  # Allow zero velocity when far
-        else:
-            linear_velocity = max(self.min_velocity if distance > 5 else 0, 
-                                min(max_vel, linear_velocity))
-        
-        # === ANGULAR CONTROL ===
-        
-        self.angle_integral += angle_error * dt
-        self.angle_integral = max(-1, min(1, self.angle_integral))  # Tight integral clamp
-        
-        angle_derivative = (angle_error - self.prev_angle_error) / dt if dt > 0 else 0.0
-        
-        angular_velocity = (self.angle_kp * angle_error + 
-                          self.angle_ki * self.angle_integral + 
-                          self.angle_kd * angle_derivative)
-        
-        # Angular velocity damping
-        current_angular_velocity = self.robot.body.angular_velocity
-        angular_velocity -= self.angular_damping * current_angular_velocity
-        
-        # Clamp angular velocity
-        angular_velocity = max(-self.max_angular_velocity, 
-                             min(self.max_angular_velocity, angular_velocity))
-        
-        # === SPEED-ADAPTIVE OBSTACLE AVOIDANCE ===
-        
-        # Calculate speed-adaptive avoidance distances
+    def _perform_safety_checks(self, current_pos: Vector2D, waypoint_idx: int) -> bool:
+        """
+        Checks for arrival, high-speed collisions, and engages emergency braking.
+        Returns True if a safety override was triggered.
+        """
+        final_target_dist = (self.target_position - current_pos).magnitude()
+        if final_target_dist < self.target_tolerance:
+            self.robot.emergency_brake()
+            self.target_position = None
+            return True
+
         current_speed = self.robot.body.velocity.magnitude()
-        speed_factor = min(current_speed / 150.0, 1.0)  # Normalize to max expected speed
+        is_final_approach = waypoint_idx >= len(self.current_path) - 1
         
-        # Increase avoidance distances based on current speed
-        dynamic_wall_distance = self.base_wall_avoidance_distance + \
-                               (self.max_wall_avoidance_distance - self.base_wall_avoidance_distance) * speed_factor
-        dynamic_emergency_distance = self.emergency_avoidance_distance + \
-                                    (self.max_emergency_distance - self.emergency_avoidance_distance) * speed_factor
+        if is_final_approach and final_target_dist < self.brake_distance and current_speed > 5.0:
+            self.robot.emergency_brake()
+            return True
+
+        if current_speed > 100.0:
+            direction = self.robot.body.velocity.normalize()
+            lookahead_pos = current_pos + direction * (current_speed * 0.3)
+            if self.environment.is_collision(lookahead_pos, 15.0):
+                self.robot.emergency_brake()
+                return True
         
-        wall_avoidance_linear, wall_avoidance_angular = self._calculate_wall_avoidance(dynamic_wall_distance, dynamic_emergency_distance)
+        return False
+
+    def _calculate_pid_commands(self, dt: float, pos: Vector2D, target: Vector2D) -> Tuple[float, float, Dict]:
+        """Calculates linear and angular velocities from PID controllers."""
+        to_target = target - pos
+        distance = to_target.magnitude()
+        angle_error = self._normalize_angle(math.atan2(to_target.y, to_target.x) - self.robot.get_orientation())
+
+        linear_velocity = self._calculate_linear_pid(dt, distance, to_target.normalize())
+        angular_velocity = self._calculate_angular_pid(dt, angle_error)
+
+        state = {'distance': distance, 'angle_error': angle_error}
+        return linear_velocity, angular_velocity, state
+
+    def _calculate_linear_pid(self, dt: float, distance: float, target_direction: Vector2D) -> float:
+        """Calculates the target linear velocity."""
+        self.position_integral += distance * dt
+        self.position_integral = max(-self.position_integral_clamp, min(self.position_integral_clamp, self.position_integral))
+        derivative = (distance - self.prev_position_error) / dt if dt > 0 else 0.0
         
-        # Apply wall avoidance with enhanced strength
-        linear_velocity += wall_avoidance_linear * self.wall_avoidance_strength
-        angular_velocity += wall_avoidance_angular * self.wall_avoidance_strength
+        desired_velocity = (self.position_kp * distance +
+                            self.position_ki * self.position_integral +
+                            self.position_kd * derivative)
+
+        velocity_scale = self._get_velocity_scale(distance)
+        damping = self._get_damping(distance)
         
-        # SPEED-ADAPTIVE OBSTACLE SLOWDOWN: More aggressive at high speeds
+        robot_velocity_in_direction = self.robot.body.velocity.dot(target_direction)
+        
+        linear_velocity = (desired_velocity * velocity_scale) - (damping * robot_velocity_in_direction)
+        
+        max_vel = self.max_velocity * velocity_scale
+        min_vel = self.min_velocity if distance > self.target_tolerance else 0
+        
+        if distance > self.precision_distance:
+            return max(0, min(max_vel, linear_velocity))
+        return max(min_vel, min(max_vel, linear_velocity))
+
+    def _calculate_angular_pid(self, dt: float, angle_error: float) -> float:
+        """Calculates the target angular velocity."""
+        self.angle_integral += angle_error * dt
+        self.angle_integral = max(-self.angle_integral_clamp, min(self.angle_integral_clamp, self.angle_integral))
+        derivative = (angle_error - self.prev_angle_error) / dt if dt > 0 else 0.0
+
+        angular_velocity = (self.angle_kp * angle_error +
+                            self.angle_ki * self.angle_integral +
+                            self.angle_kd * derivative)
+        
+        angular_velocity -= self.angular_damping * self.robot.body.angular_velocity
+        return max(-self.max_angular_velocity, min(self.max_angular_velocity, angular_velocity))
+
+    def _get_velocity_scale(self, distance: float) -> float:
+        """Calculates a velocity scale factor based on distance to target."""
+        if distance > self.max_distance_for_full_speed:
+            return 1.0
+        if distance < self.precision_distance:
+            return (self.min_velocity / self.max_velocity) + \
+                   (1 - self.min_velocity / self.max_velocity) * (distance / self.precision_distance)
+        
+        scale_range = (self.max_distance_for_full_speed - self.precision_distance)
+        return (self.min_velocity / self.max_velocity) + \
+               (1 - self.min_velocity / self.max_velocity) * ((distance - self.precision_distance) / scale_range)
+
+    def _get_damping(self, distance: float) -> float:
+        """Calculates a damping factor based on distance to target."""
+        if distance < self.precision_distance:
+            return self.base_damping + (self.max_damping - self.base_damping) * (1.0 - distance / self.precision_distance)
+        return self.base_damping
+
+    def _finalize_and_send_commands(self, linear: float, angular: float, dist: float, angle_err: float):
+        """Clamps final velocities, sends them to the robot, and updates state."""
+        final_linear = max(0, min(self.max_velocity, linear))
+        final_angular = max(-self.max_angular_velocity, min(self.max_angular_velocity, angular))
+
+        self.robot.set_velocity_command(final_linear, final_angular)
+
+        self.prev_position_error = dist
+        self.prev_angle_error = angle_err
+
+    def _normalize_angle(self, angle: float) -> float:
+        """Normalize angle to be within [-pi, pi]."""
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+
+    def _apply_obstacle_avoidance(self, linear_velocity: float, angular_velocity: float) -> Tuple[float, float]:
+        """Applies adjustments to velocity commands based on sensor readings."""
         readings = self.sensor_array.get_all_readings()
-        closest_obstacle = min([d for d in readings.values() if d is not None], default=float('inf'))
+        closest_obstacle = min((d for d in readings.values() if d is not None), default=float('inf'))
         
-        # Use dynamic wall distance for obstacle slowdown
-        if closest_obstacle < dynamic_wall_distance:
-            # More aggressive slowdown based on current speed
-            obstacle_factor = closest_obstacle / dynamic_wall_distance
+        current_speed = self.robot.body.velocity.magnitude()
+        speed_factor = min(current_speed / 150.0, 1.0)
+        
+        dynamic_wall_dist = self.base_wall_avoidance_distance + \
+                            (self.max_wall_avoidance_distance - self.base_wall_avoidance_distance) * speed_factor
+
+        if closest_obstacle < dynamic_wall_dist:
+            obstacle_factor = closest_obstacle / dynamic_wall_dist
             speed_adjusted_factor = max(0.3, 0.5 + 0.5 * obstacle_factor - 0.2 * speed_factor)
             linear_velocity *= speed_adjusted_factor
-            
-            # Reduce angular velocity for more controlled movements at high speeds
+
             angular_factor = max(0.5, 0.7 + 0.3 * obstacle_factor - 0.1 * speed_factor)
             angular_velocity *= angular_factor
+
+        avoid_linear, avoid_angular = self._calculate_avoidance_forces(readings, dynamic_wall_dist)
         
-        # === PRECISION ADJUSTMENTS ===
+        linear_velocity += avoid_linear * self.wall_avoidance_strength
+        angular_velocity += avoid_angular * self.wall_avoidance_strength
         
-        # Reduce speed when turning sharply for better precision
-        if abs(angle_error) > math.pi/4:
-            linear_velocity *= 0.3  # Slow down significantly for sharp turns
-        elif abs(angle_error) > math.pi/6:
-            linear_velocity *= 0.6  # Moderate slowdown for medium turns
+        return linear_velocity, angular_velocity
+
+    def _calculate_avoidance_forces(self, readings: Dict[str, Optional[float]], wall_dist: float) -> Tuple[float, float]:
+        """Calculates avoidance forces based on sensor readings."""
+        linear_force = 0.0
+        angular_force = 0.0
         
-        # Final velocity clamping
-        linear_velocity = max(0, min(self.max_velocity, linear_velocity))
-        angular_velocity = max(-self.max_angular_velocity, 
-                             min(self.max_angular_velocity, angular_velocity))
-        
-        # Send commands to robot
-        self.robot.set_velocity_command(linear_velocity, angular_velocity)
-        
-        # Store for next iteration
-        self.prev_position_error = distance
-        self.prev_angle_error = angle_error
-    
-    def _calculate_wall_avoidance(self, wall_distance: float = None, emergency_distance: float = None) -> Tuple[float, float]:
-        """Calculate speed-adaptive wall avoidance forces with multi-level response"""
-        readings = self.sensor_array.get_all_readings()
-        
-        # Use provided distances or defaults
-        if wall_distance is None:
-            wall_distance = self.base_wall_avoidance_distance
-        if emergency_distance is None:
-            emergency_distance = self.emergency_avoidance_distance
-        
-        linear_avoidance = 0.0
-        angular_avoidance = 0.0
-        
-        # Get sensor readings
-        front_distance = readings.get('front')
-        left_distance = readings.get('left')
-        right_distance = readings.get('right')
-        front_left_distance = readings.get('front_left')
-        front_right_distance = readings.get('front_right')
-        
-        # SPEED-ADAPTIVE FRONT OBSTACLE HANDLING
-        if front_distance and front_distance < wall_distance:
-            # Progressive braking based on distance - more aggressive at high speeds
-            if front_distance < emergency_distance:
-                # Emergency stop for very close obstacles - stronger at high speeds
-                linear_avoidance = -120.0 * (1.0 - front_distance / emergency_distance)
-            else:
-                # Gradual slowdown for moderate distances - more responsive
-                linear_avoidance = -60.0 * (1.0 - front_distance / wall_distance)
-        
-        # SIDE OBSTACLE HANDLING - Enhanced steering response
-        left_force = 0.0
-        right_force = 0.0
-        
-        # Left side obstacles - with speed-adaptive distances
-        if left_distance and left_distance < wall_distance:
-            left_force = 1.0 - left_distance / wall_distance
-            if left_distance < emergency_distance:
-                left_force *= 2.0  # Double strength for emergency
-        
-        # Right side obstacles - with speed-adaptive distances  
-        if right_distance and right_distance < wall_distance:
-            right_force = 1.0 - right_distance / wall_distance
-            if right_distance < emergency_distance:
-                right_force *= 2.0  # Double strength for emergency
-        
-        # FRONT CORNER SENSORS - Help with turning decisions
-        if front_left_distance and front_left_distance < wall_distance:
-            left_force += 0.7 * (1.0 - front_left_distance / wall_distance)
-            
-        if front_right_distance and front_right_distance < wall_distance:
-            right_force += 0.7 * (1.0 - front_right_distance / wall_distance)
-        
-        # Calculate net angular avoidance
-        angular_avoidance = (right_force - left_force) * 1.2  # Increased steering strength
-        
-        # Clamp angular avoidance to reasonable limits
-        angular_avoidance = max(-2.0, min(2.0, angular_avoidance))
-        
-        return linear_avoidance, angular_avoidance
+        emergency_dist = self.emergency_avoidance_distance
+
+        if (front_dist := readings.get('front')) and front_dist < wall_dist:
+            linear_force = -120.0 * (1 - front_dist / emergency_dist) if front_dist < emergency_dist else -60.0 * (1 - front_dist / wall_dist)
+
+        left_push = 0.0
+        if (left_dist := readings.get('left')) and left_dist < wall_dist:
+            left_push = (1 - left_dist / wall_dist) * (2 if left_dist < emergency_dist else 1)
+        if (front_left_dist := readings.get('front_left')) and front_left_dist < wall_dist:
+            left_push += 0.7 * (1 - front_left_dist / wall_dist)
+
+        right_push = 0.0
+        if (right_dist := readings.get('right')) and right_dist < wall_dist:
+            right_push = (1 - right_dist / wall_dist) * (2 if right_dist < emergency_dist else 1)
+        if (front_right_dist := readings.get('front_right')) and front_right_dist < wall_dist:
+            right_push += 0.7 * (1 - front_right_dist / wall_dist)
+
+        angular_force = max(-2.0, min(2.0, (right_push - left_push) * 1.2))
+        return linear_force, angular_force
     
     def is_at_target(self) -> bool:
         """Check if robot has reached the target"""
@@ -531,44 +451,40 @@ class PrecisionMovementController(RobotController):
         obstacle_detected = closest_obstacle < self.base_wall_avoidance_distance
         
         # Determine status
-        if distance < self.target_tolerance:
-            status = "TARGET REACHED"
-        elif obstacle_detected and closest_obstacle < self.emergency_avoidance_distance:
-            status = "EMERGENCY AVOID"
-        elif obstacle_detected:
-            status = "AVOIDING OBSTACLE"
-        elif distance < self.brake_distance and current_speed > 5.0:
-            status = "EMERGENCY BRAKE"
-        elif distance < self.precision_distance:
-            status = "PRECISION MODE"
-        else:
-            status = "APPROACH MODE"
+        status = self._determine_robot_status(distance, current_speed, closest_obstacle)
         
-        # Calculate current velocity scale and damping
-        if distance > self.max_distance:
-            velocity_scale = 1.0
-        elif distance < self.precision_distance:
-            velocity_scale = 0.5 + 0.5 * (distance / self.precision_distance)  # 50-100% instead of 20-100%
-        else:
-            velocity_scale = 0.7 + 0.3 * (distance / self.max_distance)       # 70-100% instead of 50-100%
+        # Calculate current velocity scale and damping for display
+        velocity_scale = 1.0
+        if distance < self.precision_distance:
+            velocity_scale = (self.min_velocity / self.max_velocity) + \
+                             (1 - self.min_velocity / self.max_velocity) * (distance / self.precision_distance)
         
+        damping_factor = self.base_damping
         if distance < self.precision_distance:
             damping_factor = self.base_damping + (self.max_damping - self.base_damping) * \
                            (1.0 - distance / self.precision_distance)
-        else:
-            damping_factor = self.base_damping
         
         return {
-            "distance": f"{distance:.1f}",
-            "speed": f"{current_speed:.1f}",
-            "velocity_scale": f"{velocity_scale:.2f}",
-            "damping": f"{damping_factor:.2f}",
-            "brake_zone": "YES" if distance < self.brake_distance else "NO",
-            "closest_obstacle": f"{closest_obstacle:.1f}" if closest_obstacle != float('inf') else "NONE",
-            "obstacle_avoid": "YES" if obstacle_detected else "NO",
-            "waypoint_dist": f"{waypoint_distance:.1f}" if current_waypoint else "NONE",
-            "current_wp_idx": f"{self.current_waypoint_index}",
-            "waypoints_left": f"{len(self.current_path) - self.current_waypoint_index}" if self.current_path else "0",
-            "pathfinding": "A*" if self.pathfinder else "DIRECT",
-            "status": status
+            "Status": status,
+            "Distance": f"{distance:.1f}",
+            "Speed": f"{current_speed:.1f}",
+            "Velocity Scale": f"{velocity_scale:.2f}",
+            "Damping": f"{damping_factor:.2f}",
+            "Closest Obstacle": f"{closest_obstacle:.1f}" if closest_obstacle != float('inf') else "None",
+            "Waypoint Dist": f"{waypoint_distance:.1f}" if current_waypoint else "N/A",
+            "Pathfinding": "A*" if self.pathfinder else "Direct",
         }
+
+    def _determine_robot_status(self, distance: float, speed: float, closest_obstacle: float) -> str:
+        """Determine the current status of the robot for debugging."""
+        if distance < self.target_tolerance:
+            return "Target Reached"
+        if closest_obstacle < self.emergency_avoidance_distance:
+            return "Emergency Avoid"
+        if closest_obstacle < self.base_wall_avoidance_distance:
+            return "Avoiding Obstacle"
+        if distance < self.brake_distance and speed > 5.0:
+            return "Braking"
+        if distance < self.precision_distance:
+            return "Precision Mode"
+        return "Approach Mode"
